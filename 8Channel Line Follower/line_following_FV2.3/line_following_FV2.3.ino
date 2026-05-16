@@ -14,7 +14,7 @@ const int BTN_CALI = 12;
 const int BTN_RUN  = 11;
 
 const unsigned long CALI_TIME = 5000;
-const unsigned long RUN_DELAY = 1000;
+const unsigned long RUN_DELAY = 100;
 
 unsigned long caliStartTime = 0;
 unsigned long runDelayTimer = 0;
@@ -33,13 +33,17 @@ bool caliDone = false;
 bool buzzerActive = false;
 bool debug = false;
 
-int baseSpeed = 250;
+/************ CONSISTENT SPEED ************/
+
+int baseSpeed = 200;
 
 long position = 3500;
 long lastError = 0;
 
-float Kp = 0.06;
-float Kd = 2.0;
+/************ SINGLE CONSISTENT PD ************/
+
+float Kp = 0.08;
+float Kd = 2.5;
 
 float filteredDerivative = 0;
 
@@ -145,6 +149,7 @@ void loop(){
     lostLine = false;
 
     robotState = NORMAL;
+
   }
 
   if(runMode){
@@ -163,11 +168,11 @@ void loop(){
 
           if(lastDir >= 0){
 
-            motor(-180, 180);
+            motor(-170, 170);
           }
           else{
 
-            motor(180, -180);
+            motor(170, -170);
           }
 
           return;
@@ -219,6 +224,11 @@ void checkLostLine(){
 
 void lineFollow(){
 
+  /************ SINGLE CONSISTENT PID ************/
+
+  float Kp_use = Kp;
+  float Kd_use = Kd;
+
   long target = 3500;
 
   long error = position - target;
@@ -248,8 +258,8 @@ void lineFollow(){
     (derivative * 0.3);
 
   long correction =
-    (Kp * error) +
-    (Kd * filteredDerivative);
+    (Kp_use * error) +
+    (Kd_use * filteredDerivative);
 
   correction = constrain(correction, -255, 255);
 
