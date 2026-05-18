@@ -1,0 +1,517 @@
+const int sensorPin[8] = {A0,A1,A2,A3,A4,A5,A6,A7};
+
+const int BUZZER = 13;
+
+const int PWMA = 5;
+const int PWMB = 6;
+const int AIN1 = 2;
+const int AIN2 = 3;
+const int BIN1 = 8;
+const int BIN2 = 7;
+const int STBY = 4;
+
+const int BTN_CALI = 12;
+const int BTN_RUN  = 11;
+
+const unsigned long CALI_TIME = 5000;
+const unsigned long RUN_DELAY = 100;
+
+unsigned long caliStartTime = 0;
+unsigned long runDelayTimer = 0;
+
+#define CALI_AUTO 1
+
+int sensorMin[8];
+int sensorMax[8];
+int sensorVal[8];
+
+bool runPending = false;
+bool caliMode = false;
+bool runMode = false;
+bool caliDone = false;
+
+bool buzzerActive = false;
+bool debug = false;
+
+/************ SPEED SYSTEM ************/
+
+int normalSpeed = 240; // 10V
+int boostSpeed  = 255;
+
+int baseSpeed = normalSpeed;
+
+/************ SINGLE CONSISTENT PD ************/
+
+float Kp = 0.12; // 10V
+float Kd = 3.8;  // 10V
+
+// float Kp = 0.08; // 12V
+// float Kd = 1.5;  // 12V
+
+float filteredDerivative = 0;
+
+long position = 3500;
+long lastError = 0;
+
+int lastDir = 0;
+bool lostLine = false;
+
+long sensorSum = 0;
+
+#define LOST_LINE_THRESHOLD 500
+
+/************ STRAIGHT BOOST SYSTEM ************/
+
+bool boostActive = false;
+
+unsigned long straightTimer = 0;
+unsigned long boostTimer = 0;
+
+const unsigned long STRAIGHT_CONFIRM_TIME = 80;
+const unsigned long BOOST_DURATION = 1000;
+
+const int STRAIGHT_ERROR_THRESHOLD = 120;
+const int STRAIGHT_DERIVATIVE_THRESHOLD = 40;
+
+enum RobotState {
+  NORMAL,
+};
+
+RobotState robotState = NORMAL;
+
+void calibration();
+void endCalibration();
+void readSensor();
+void checkLostLine();
+void lineFollow();
+void motor(int left, int right);
+void triggerBuzzer();
+void updateBuzzer();
+void updateStraightBoost(long error, long derivative);
+
+int buzzerStep = 0;
+unsigned long buzzerTimer = 0;
+
+const unsigned long BUZZ_ON = 80;
+const unsigned long BUZZ_OFF = 80;
+
+void setup(){
+
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  pinMode(STBY, OUTPUT);
+
+  pinMode(BTN_CALI, INPUT_PULLUP);
+  pinMode(BTN_RUN, INPUT_PULLUP);
+
+  pinMode(BUZZER, OUTPUT);
+
+  digitalWrite(BUZZER, LOW);
+  digitalWrite(STBY, HIGH);
+
+  for(int i = 0; i < 8; i++){
+
+    sensorMin[i] = 1023;
+    sensorMax[i] = 0;
+  }
+}
+
+void loop(){
+
+  if(!runMode && digitalRead(BTN_CALI) == LOW){
+
+    delay(200);
+
+    if(!caliMode){
+
+      caliMode = true;
+      caliDone = false;
+
+      caliStartTime = millis();
+    }
+
+    while(digitalRead(BTN_CALI) == LOW);
+  }
+
+  if(caliMode){
+
+    calibration();
+
+    if(CALI_AUTO && millis() - caliStartTime >= CALI_TIME){
+
+      endCalibration();
+    }
+  }
+
+  if(caliDone &&
+     !runMode &&
+     !runPending &&
+     digitalRead(BTN_RUN) == LOW){
+
+    delay(200);
+
+    runPending = true;
+
+    runDelayTimer = millis();
+
+    while(digitalRead(BTN_RUN) == LOW);
+  }
+
+  if(runPending &&
+     millis() - runDelayTimer >= RUN_DELAY){
+
+    runPending = false;
+
+    runMode = true;
+
+    lostLine = false;
+
+    robotState = NORMAL;
+  }
+
+  if(runMode){
+
+    readSensor();
+
+    checkLostLine();
+
+    updateBuzzer();
+
+    switch(robotState){
+
+      case NORMAL:
+
+        /************ LOST LINE RECOVERY ************/
+
+        if(lostLine){
+
+          boostActive = false;
+
+          if(lastDir >= 0){
+
+            motor(-50, 200); //10V
+            // motor(-50, 170); //12V
+          }
+          else{
+
+            motor(200, -50); //10V
+            // motor(170, -50); //12V
+          }
+
+          return;
+        }
+
+        lineFollow();
+
+      break;
+    }
+  }
+}
+
+void readSensor(){
+
+  long sum = 0;
+  long weighted = 0;
+
+  for(int i = 0; i < 8; i++){
+
+    int v = analogRead(sensorPin[i]);
+
+    v = constrain(v, sensorMin[i], sensorMax[i]);
+
+    v = map(v, sensorMin[i], sensorMax[i], 0, 1000);
+
+    if(v < 50){
+
+      v = 0;
+    }
+
+    sensorVal[i] = v;
+
+    sum += v;
+
+    weighted += (long)v * (i * 1000);
+  }
+
+  sensorSum = sum;
+
+  if(sum > 0){
+
+    position = weighted / sum;
+  }
+}
+
+void checkLostLine(){
+
+  lostLine = (sensorSum < LOST_LINE_THRESHOLD);
+}
+
+void updateStraightBoost(long error, long derivative){
+
+  bool straightStable =
+    abs(error) < STRAIGHT_ERROR_THRESHOLD &&
+    abs(derivative) < STRAIGHT_DERIVATIVE_THRESHOLD;
+
+  unsigned long now = millis();
+
+  /************ DETECT STABLE STRAIGHT ************/
+
+  if(straightStable){
+
+    if(straightTimer == 0){
+
+      straightTimer = now;
+    }
+
+    if(!boostActive &&
+       now - straightTimer >= STRAIGHT_CONFIRM_TIME){
+
+      boostActive = true;
+
+      boostTimer = now;
+    }
+  }
+  else{
+
+    /************ CANCEL BOOST IMMEDIATELY ************/
+
+    straightTimer = 0;
+
+    boostActive = false;
+  }
+
+  /************ BOOST TIME LIMIT ************/
+
+  if(boostActive &&
+     now - boostTimer >= BOOST_DURATION){
+
+    boostActive = false;
+  }
+
+  /************ APPLY SPEED ************/
+
+  if(boostActive){
+
+    baseSpeed = boostSpeed;
+  }
+  else{
+
+    baseSpeed = normalSpeed;
+  }
+}
+
+void lineFollow(){
+
+  /************ SINGLE CONSISTENT PD ************/
+
+  float Kp_use = Kp;
+  float Kd_use = Kd;
+
+  long target = 3500;
+
+  long error = position - target;
+
+  /************ DEAD BAND ************/
+
+  if(abs(error) < 25){
+
+    error = 0;
+  }
+
+  /************ LAST DIRECTION MEMORY ************/
+
+  if(error > 100){
+
+    lastDir = 1;
+  }
+  else if(error < -100){
+
+    lastDir = -1;
+  }
+
+  long derivative = error - lastError;
+
+  /************ STRAIGHT BOOST ************/
+
+  updateStraightBoost(error, derivative);
+
+  /************ DERIVATIVE FILTER ************/
+
+  filteredDerivative =
+    (filteredDerivative * 0.7) +
+    (derivative * 0.3);
+
+  long correction =
+    (Kp_use * error) +
+    (Kd_use * filteredDerivative);
+
+  correction = constrain(correction, -255, 255);
+
+  lastError = error;
+
+  int leftPWM =
+    constrain(baseSpeed - correction, -255, 255);
+
+  int rightPWM =
+    constrain(baseSpeed + correction, -255, 255);
+
+  motor(leftPWM, rightPWM);
+}
+
+void motor(int left, int right){
+
+  if(debug){
+
+    analogWrite(PWMA, 0);
+    analogWrite(PWMB, 0);
+
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
+
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+
+    return;
+  }
+
+  /************ LEFT MOTOR ************/
+
+  if(left >= 0){
+
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+
+    analogWrite(PWMA, left);
+  }
+  else{
+
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+
+    analogWrite(PWMA, -left);
+  }
+
+  /************ RIGHT MOTOR ************/
+
+  if(right >= 0){
+
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+
+    analogWrite(PWMB, right);
+  }
+  else{
+
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+
+    analogWrite(PWMB, -right);
+  }
+}
+
+void calibration(){
+
+  /************ AUTO ROTATE FOR CALIBRATION ************/
+
+  if(CALI_AUTO){
+
+    motor(90, -90);
+  }
+
+  for(int i = 0; i < 8; i++){
+
+    int v = analogRead(sensorPin[i]);
+
+    if(v < sensorMin[i]){
+
+      sensorMin[i] = v;
+    }
+
+    if(v > sensorMax[i]){
+
+      sensorMax[i] = v;
+    }
+  }
+}
+
+void endCalibration(){
+
+  caliMode = false;
+
+  caliDone = true;
+
+  motor(0, 0);
+}
+
+void triggerBuzzer(){
+
+  buzzerActive = true;
+
+  buzzerStep = 0;
+
+  buzzerTimer = millis();
+}
+
+void updateBuzzer(){
+
+  if(!buzzerActive) return;
+
+  unsigned long now = millis();
+
+  switch(buzzerStep){
+
+    case 0:
+
+      digitalWrite(BUZZER, HIGH);
+
+      if(now - buzzerTimer >= BUZZ_ON){
+
+        buzzerTimer = now;
+
+        buzzerStep++;
+      }
+
+    break;
+
+    case 1:
+
+      digitalWrite(BUZZER, LOW);
+
+      if(now - buzzerTimer >= BUZZ_OFF){
+
+        buzzerTimer = now;
+
+        buzzerStep++;
+      }
+
+    break;
+
+    case 2:
+
+      digitalWrite(BUZZER, HIGH);
+
+      if(now - buzzerTimer >= BUZZ_ON){
+
+        buzzerTimer = now;
+
+        buzzerStep++;
+      }
+
+    break;
+
+    case 3:
+
+      digitalWrite(BUZZER, LOW);
+
+      buzzerActive = false;
+
+    break;
+  }
+}
